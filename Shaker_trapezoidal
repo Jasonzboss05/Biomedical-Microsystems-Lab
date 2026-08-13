@@ -1,0 +1,251 @@
+/*
+ * XY cell culture shaker — X + Y, TRAPEZOIDAL + DWELL + SNAP, ALTERNATING
+ * with adjustable INTER-AXIS REST
+ * ESP32 + two TMC2209 (standalone STEP/DIR) + two NEMA 17
+ *
+ * Each stroke: glide out -> stop at extreme -> DWELL -> SNAP away.
+ * End of burst: return to center, settle, REST, then hand off to the other axis.
+ * The two axes never move at the same time.
+ *
+ *   dwellSec (D) — pause at each stroke extreme (within an axis)
+ *   restSec  (W) — pause between one axis stopping and the next starting
+ *
+ * Pins:  X_STEP=32  X_DIR=33   Y_STEP=18  Y_DIR=19
+ *        X_EN=25    Y_EN=4     (TMC2209 EN active LOW)
+ *
+ * Serial (115200):
+ *   A 50   amplitude, mm            V 120  cruise velocity, mm/s
+ *   C 500  arrival accel, mm/s^2    B 2500 breakaway (snap) accel, mm/s^2
+ *   D 150  dwell at each end, ms    W 500  rest between axes, ms
+ *   N 3    cycles per burst         X pause   R resume   ? status
+ *
+ * Requires ESP32 Arduino core 3.x.
+ */
+
+#include <math.h>
+
+// ---------------- mechanics ----------------
+constexpr float STEPS_PER_MM = 1600.0f / 40.0f;   // 40 steps/mm
+constexpr float MAX_AMP_MM   = 100.0f;
+constexpr float ARRIVE_EPS   = 0.05f;             // mm — "arrived" band
+
+constexpr uint32_t ISR_HZ     = 40000;
+constexpr uint32_t PROFILE_HZ = 1000;
+
+// Keep cruise step rate under 60% of the ISR rate.
+constexpr float MAX_VEL = 0.6f * ISR_HZ / STEPS_PER_MM;   // = 600 mm/s
+
+constexpr int X_EN = 25;
+constexpr int Y_EN = 4;
+
+// ---------------- axes ----------------
+struct Axis {
+  const int stepPin;
+  const int dirPin;
+  volatile int32_t target;    // steps, written by profile loop
+  volatile int32_t current;   // steps, owned by ISR
+  float posMM;                // commanded position, mm from center
+  float velNow;               // current velocity, mm/s (signed)
+  float targetMM;             // current waypoint, mm
+  float dwellLeft;            // s remaining in dwell
+};
+
+Axis axisX = { 32, 33, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f };
+Axis axisY = { 18, 19, 0, 0, 0.0f, 0.0f, 0.0f, 0.0f };
+
+// ---------------- commanded motion ----------------
+float ampCmd   = 50.8f;    // mm  (2 in half-stroke)
+float velCmd   = 1000.0f;   // mm/s  cruise
+float accCmd   = 3000.0f;   // mm/s^2  arrival decel (firmness of the stop)
+float breakAcc = 3000.0f;  // mm/s^2  departure accel (the snap)
+float dwellSec = 0.150f;   // s  dwell at each extreme
+float restSec  = 1.0f;     // s  <-- REST between X stopping and Y starting
+int   cyclesPerBurst = 3;
+bool  running = true;
+
+hw_timer_t *stepTimer = nullptr;
+
+// ---------------- supervisor ----------------
+enum Sub { MOVE, DWELL, SETTLE };
+Axis* act  = &axisX;
+Axis* idle = &axisY;
+Sub   sub  = MOVE;
+int   extremesLeft = 0;
+float restLeft = 0.0f;      // s remaining in inter-axis rest
+
+// ---------------- step generator (both axes) ----------------
+void IRAM_ATTR onStepISR() {
+  int32_t ex = axisX.target - axisX.current;
+  if (ex != 0) {
+    digitalWrite(axisX.dirPin, ex > 0 ? HIGH : LOW);
+    digitalWrite(axisX.stepPin, HIGH);
+    axisX.current += (ex > 0) ? 1 : -1;
+    digitalWrite(axisX.stepPin, LOW);
+  }
+  int32_t ey = axisY.target - axisY.current;
+  if (ey != 0) {
+    digitalWrite(axisY.dirPin, ey > 0 ? HIGH : LOW);
+    digitalWrite(axisY.stepPin, HIGH);
+    axisY.current += (ey > 0) ? 1 : -1;
+    digitalWrite(axisY.stepPin, LOW);
+  }
+}
+
+// ---------------- helpers ----------------
+static const char* axisName(Axis* a) { return (a == &axisX) ? "X" : "Y"; }
+
+static void startBurst(Axis* a) {
+  a->posMM     = 0.0f;
+  a->velNow    = 0.0f;
+  a->targetMM  = ampCmd;                 // first waypoint: +A
+  a->dwellLeft = 0.0f;
+  extremesLeft = 2 * cyclesPerBurst;     // extreme visits before returning
+  sub          = MOVE;
+}
+
+static void status() {
+  Serial.printf("active=%s  sub=%d  A=%.1f  V=%.0f  C=%.0f  B=%.0f  D=%.0fms  W=%.0fms  N=%d  %s\n",
+                axisName(act), (int)sub, ampCmd, velCmd, accCmd, breakAcc,
+                dwellSec * 1000.0f, restSec * 1000.0f, cyclesPerBurst,
+                running ? "running" : "PAUSED");
+}
+
+static void handleSerial() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  if (c == '?')             { status(); return; }
+  if (c == 'X' || c == 'x') { running = false; Serial.println("pausing");  return; }
+  if (c == 'R' || c == 'r') { running = true;  Serial.println("resuming"); return; }
+
+  float v = Serial.parseFloat();
+  switch (c) {
+    case 'A': case 'a':
+      if (v >= 0 && v <= MAX_AMP_MM) ampCmd = v; else Serial.println("amp out of range");
+      break;
+    case 'V': case 'v':
+      if (v > 0 && v <= MAX_VEL) velCmd = v; else Serial.println("vel out of range");
+      break;
+    case 'C': case 'c':
+      if (v > 0) accCmd = v; else Serial.println("acc must be > 0");
+      break;
+    case 'B': case 'b':
+      if (v > 0) breakAcc = v; else Serial.println("breakAcc must be > 0");
+      break;
+    case 'D': case 'd':
+      if (v >= 0) dwellSec = v / 1000.0f; else Serial.println("dwell must be >= 0");
+      break;
+    case 'W': case 'w':
+      if (v >= 0) restSec = v / 1000.0f; else Serial.println("rest must be >= 0");
+      break;
+    case 'N': case 'n':
+      if (v >= 1) cyclesPerBurst = (int)v;
+      break;
+    default: return;
+  }
+  status();
+}
+
+// ---------------- setup / loop ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(axisX.stepPin, OUTPUT); pinMode(axisX.dirPin, OUTPUT);
+  pinMode(axisY.stepPin, OUTPUT); pinMode(axisY.dirPin, OUTPUT);
+  pinMode(X_EN, OUTPUT); digitalWrite(X_EN, LOW);   // enable X driver
+  pinMode(Y_EN, OUTPUT); digitalWrite(Y_EN, LOW);   // enable Y driver
+
+  // both carriages assumed centered at power-on
+  axisX.current = axisY.current = 0;
+  axisX.target  = axisY.target  = 0;
+
+  stepTimer = timerBegin(1000000);                  // 1 MHz tick
+  timerAttachInterrupt(stepTimer, &onStepISR);
+  timerAlarm(stepTimer, 1000000 / ISR_HZ, true, 0);
+
+  // --- core 2.x equivalent ---
+  // stepTimer = timerBegin(0, 80, true);
+  // timerAttachInterrupt(stepTimer, &onStepISR, true);
+  // timerAlarmWrite(stepTimer, 1000000 / ISR_HZ, true);
+  // timerAlarmEnable(stepTimer);
+
+  startBurst(act);
+  Serial.println("XY trapezoidal + dwell + snap + inter-axis rest ready");
+  status();
+}
+
+void loop() {
+  handleSerial();
+
+  static uint32_t last = 0;
+  uint32_t now = micros();
+  if ((uint32_t)(now - last) < 1000000UL / PROFILE_HZ) return;
+  float dt = (now - last) * 1e-6f;
+  last = now;
+  if (dt > 0.05f) dt = 0.05f;
+
+  idle->target = 0;                 // parked axis never moves
+
+  // ----- paused: decelerate active axis to a stop and hold -----
+  if (!running) {
+    float speed = fabsf(act->velNow) - accCmd * dt;
+    if (speed < 0.0f) speed = 0.0f;
+    act->velNow = copysignf(speed, act->velNow);
+    act->posMM += act->velNow * dt;
+    act->target = lroundf(act->posMM * STEPS_PER_MM);
+    return;
+  }
+
+  switch (sub) {
+    case MOVE: {
+      float remaining = act->targetMM - act->posMM;   // signed
+      float dist = fabsf(remaining);
+
+      if (dist < ARRIVE_EPS) {
+        act->posMM  = act->targetMM;    // snap onto the waypoint, fully stop
+        act->velNow = 0.0f;
+        if (act->targetMM != 0.0f) {    // arrived at an extreme -> dwell
+          act->dwellLeft = dwellSec;
+          sub = DWELL;
+        } else {                        // arrived at center -> settle, then rest
+          sub = SETTLE;
+          restLeft = restSec;           // begin the inter-axis rest countdown
+        }
+      } else {
+        float dir    = (remaining >= 0.0f) ? 1.0f : -1.0f;
+        float vAccel = fabsf(act->velNow) + breakAcc * dt;   // ramp up = the SNAP
+        float vDecel = sqrtf(2.0f * accCmd * dist);          // arrival envelope (soft)
+        float speed  = fminf(fminf(vAccel, velCmd), vDecel);
+        act->velNow  = dir * speed;
+        act->posMM  += act->velNow * dt;
+      }
+      break;
+    }
+
+    case DWELL:
+      act->velNow = 0.0f;                          // sit still at the extreme
+      act->dwellLeft -= dt;
+      if (act->dwellLeft <= 0.0f) {
+        extremesLeft--;
+        act->targetMM = (extremesLeft > 0) ? -act->targetMM   // snap to opposite end
+                                           : 0.0f;            // last leg: back to center
+        sub = MOVE;
+      }
+      break;
+
+    case SETTLE:
+      act->velNow = 0.0f;
+      break;
+  }
+
+  act->target = lroundf(act->posMM * STEPS_PER_MM);
+
+  // hand off once the active axis has fully settled at center AND rested
+  if (sub == SETTLE && act->current == 0) {
+    restLeft -= dt;                     // count down only once fully stopped
+    if (restLeft <= 0.0f) {
+      Serial.printf("hand off %s -> %s\n", axisName(act), axisName(idle));
+      Axis* t = act; act = idle; idle = t;
+      startBurst(act);
+    }
+  }
+}
